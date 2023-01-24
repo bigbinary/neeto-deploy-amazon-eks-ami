@@ -26,6 +26,9 @@ in the Packer documentation.
 
 ## 👷 Building the AMI
 
+
+First edit the [files/docker-daemon.json](/files/docker-daemon.json) file and add the ClusterIP of your docker registry service that you want to mark as an insecure registry. You can edit any other file as required and follow the rest of the steps to build the image. Once you run `make 1.23`, the image would be compiled and pushed to your AWS account automatically based on the credentials that you have set in your local machine.
+
 A Makefile is provided to build the Amazon EKS Worker AMI, but it is just a small wrapper around
 invoking Packer directly. You can initiate the build process by running the
 following command in the root of this repository:

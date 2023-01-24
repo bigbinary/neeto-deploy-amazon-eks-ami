@@ -1,4 +1,5 @@
 {
+  "insecure-registries": ["clusterIP:5000"],
   "bridge": "none",
   "log-driver": "json-file",
   "log-opts": {
