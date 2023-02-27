@@ -49,13 +49,6 @@ else
 fi
 
 ################################################################################
-### Utilities ##################################################################
-################################################################################
-
-sudo chmod -R a+x $TEMPLATE_DIR/bin/
-sudo mv $TEMPLATE_DIR/bin/* /usr/bin/
-
-################################################################################
 ### Packages ###################################################################
 ################################################################################
 
@@ -75,11 +68,13 @@ sudo yum install -y \
   socat \
   unzip \
   wget \
-  yum-plugin-versionlock \
-  yum-utils
+  yum-utils \
+  yum-plugin-versionlock
 
 # Remove any old kernel versions. `--count=1` here means "only leave 1 kernel version installed"
 sudo package-cleanup --oldkernels --count=1 -y
+
+sudo yum versionlock kernel-$(uname -r)
 
 # Remove the ec2-net-utils package, if it's installed. This package interferes with the route setup on the instance.
 if yum list installed | grep ec2-net-utils; then sudo yum remove ec2-net-utils -y -q; fi
@@ -141,6 +136,12 @@ else
   sudo yum install -y awscli
 fi
 
+################################################################################
+### systemd ####################################################################
+################################################################################
+
+sudo mv "${TEMPLATE_DIR}/runtime.slice" /etc/systemd/system/runtime.slice
+
 ###############################################################################
 ### Containerd setup ##########################################################
 ###############################################################################
@@ -197,7 +198,12 @@ EOF
 
 sudo yum install -y device-mapper-persistent-data lvm2
 
-INSTALL_DOCKER="${INSTALL_DOCKER:-true}"
+if [[ ! -v "INSTALL_DOCKER" ]]; then
+  INSTALL_DOCKER=$(vercmp "$KUBERNETES_VERSION" lt "1.25.0" || true)
+else
+  echo "WARNING: using override INSTALL_DOCKER=${INSTALL_DOCKER}. This option is deprecated and will be removed in a future release."
+fi
+
 if [[ "$INSTALL_DOCKER" == "true" ]]; then
   sudo amazon-linux-extras enable docker
   sudo groupadd -og 1950 docker
