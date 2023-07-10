@@ -20,7 +20,7 @@ export LANG="C"
 export LC_ALL="C"
 
 # Global options
-readonly PROGRAM_VERSION="0.7.3"
+readonly PROGRAM_VERSION="0.7.6"
 readonly PROGRAM_SOURCE="https://github.com/awslabs/amazon-eks-ami/blob/master/log-collector-script/"
 readonly PROGRAM_NAME="$(basename "$0" .sh)"
 readonly PROGRAM_DIR="/opt/log-collector"
@@ -50,6 +50,7 @@ REQUIRED_UTILS=(
 
 COMMON_DIRECTORIES=(
   kernel
+  modinfo
   system
   docker
   containerd
@@ -71,6 +72,7 @@ COMMON_LOGS=(
   pods           # eks
   cloud-init.log
   cloud-init-output.log
+  user-data.log
   kube-proxy.log
 )
 
@@ -262,6 +264,7 @@ collect() {
   get_region
   get_common_logs
   get_kernel_info
+  get_modinfo
   get_mounts_info
   get_selinux_info
   get_iptables_info
@@ -352,6 +355,9 @@ get_common_logs() {
         cp --force --dereference --recursive /var/log/containers/kube-proxy* "${COLLECT_DIR}"/var_log/ 2> /dev/null
         cp --force --dereference --recursive /var/log/containers/ebs-csi* "${COLLECT_DIR}"/var_log/ 2> /dev/null
         cp --force --dereference --recursive /var/log/containers/efs-csi* "${COLLECT_DIR}"/var_log/ 2> /dev/null
+        cp --force --dereference --recursive /var/log/containers/fsx-csi* "${COLLECT_DIR}"/var_log/ 2> /dev/null
+        cp --force --dereference --recursive /var/log/containers/fsx-openzfs-csi* "${COLLECT_DIR}"/var_log/ 2> /dev/null
+        cp --force --dereference --recursive /var/log/containers/file-cache-csi* "${COLLECT_DIR}"/var_log/ 2> /dev/null
         continue
       fi
       if [[ "${entry}" == "pods" ]]; then
@@ -361,6 +367,9 @@ get_common_logs() {
         cp --force --dereference --recursive /var/log/pods/kube-system_kube-proxy* "${COLLECT_DIR}"/var_log/ 2> /dev/null
         cp --force --dereference --recursive /var/log/pods/kube-system_ebs-csi-* "${COLLECT_DIR}"/var_log/ 2> /dev/null
         cp --force --dereference --recursive /var/log/pods/kube-system_efs-csi-* "${COLLECT_DIR}"/var_log/ 2> /dev/null
+        cp --force --dereference --recursive /var/log/pods/kube-system_fsx-csi-* "${COLLECT_DIR}"/var_log/ 2> /dev/null
+        cp --force --dereference --recursive /var/log/pods/kube-system_fsx-openzfs-csi-* "${COLLECT_DIR}"/var_log/ 2> /dev/null
+        cp --force --dereference --recursive /var/log/pods/kube-system_file-cache-csi-* "${COLLECT_DIR}"/var_log/ 2> /dev/null
         continue
       fi
       cp --force --recursive --dereference /var/log/"${entry}" "${COLLECT_DIR}"/var_log/ 2> /dev/null
@@ -381,6 +390,12 @@ get_kernel_info() {
   uname -a > "${COLLECT_DIR}/kernel/uname.txt"
 
   ok
+}
+
+# collect modinfo on specific modules for debugging purposes
+get_modinfo() {
+  try "collect modinfo"
+  modinfo lustre > "${COLLECT_DIR}/modinfo/lustre"
 }
 
 get_docker_logs() {
@@ -524,6 +539,14 @@ get_networking_info() {
   fi
 
   cp /etc/resolv.conf "${COLLECT_DIR}"/networking/resolv.conf
+
+  # collect ethtool -S for all interfaces
+  INTERFACES=$(ip -o a | awk '{print $2}' | sort -n | uniq)
+  for ifc in ${INTERFACES}; do
+    echo "Interface ${ifc}" >> "${COLLECT_DIR}"/networking/ethtool.txt
+    ethtool -S ${ifc} >> "${COLLECT_DIR}"/networking/ethtool.txt 2>&1
+    echo -e "\n" >> "${COLLECT_DIR}"/networking/ethtool.txt
+  done
   ok
 }
 
