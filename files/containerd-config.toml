@@ -11,9 +11,6 @@ default_runtime_name = "runc"
 [plugins."io.containerd.grpc.v1.cri"]
 sandbox_image = "SANDBOX_IMAGE"
 
-[plugins."io.containerd.grpc.v1.cri".registry]
-config_path = "/etc/containerd/certs.d:/etc/docker/certs.d"
-
 [plugins."io.containerd.grpc.v1.cri".containerd.runtimes.runc]
 runtime_type = "io.containerd.runc.v2"
 
@@ -23,3 +20,11 @@ SystemdCgroup = true
 [plugins."io.containerd.grpc.v1.cri".cni]
 bin_dir = "/opt/cni/bin"
 conf_dir = "/etc/cni/net.d"
+
+[plugins."io.containerd.grpc.v1.cri".registry]
+  [plugins."io.containerd.grpc.v1.cri".registry.mirrors]
+    [plugins."io.containerd.grpc.v1.cri".registry.mirrors."10.100.0.20:5000"]
+      endpoint = ["http://10.100.0.20:5000"]
+  [plugins."io.containerd.grpc.v1.cri".registry.configs]
+    [plugins."io.containerd.grpc.v1.cri".registry.configs."10.100.0.20:5000".tls]
+      insecure_skip_verify = true
