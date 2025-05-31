@@ -20,8 +20,8 @@ export LANG="C"
 export LC_ALL="C"
 
 # Global options
-readonly PROGRAM_VERSION="0.7.6"
-readonly PROGRAM_SOURCE="https://github.com/awslabs/amazon-eks-ami/blob/master/log-collector-script/"
+readonly PROGRAM_VERSION="0.7.8"
+readonly PROGRAM_SOURCE="https://github.com/awslabs/amazon-eks-ami/blob/main/log-collector-script/"
 readonly PROGRAM_NAME="$(basename "$0" .sh)"
 readonly PROGRAM_DIR="/opt/log-collector"
 readonly LOG_DIR="/var/log"
@@ -31,10 +31,12 @@ readonly DAYS_10=$(date -d "-10 days" '+%Y-%m-%d %H:%M')
 INSTANCE_ID=""
 INIT_TYPE=""
 PACKAGE_TYPE=""
+IMDS_TOKEN=""
 
 # Script run defaults
 ignore_introspection='false'
 ignore_metrics='false'
+eks_hybrid='false'
 
 REQUIRED_UTILS=(
   timeout
@@ -61,7 +63,9 @@ COMMON_DIRECTORIES=(
   ipamd         # eks
   sysctls       # eks
   kubelet       # eks
+  nodeadm       # eks
   cni           # eks
+  gpu           # eks
 )
 
 COMMON_LOGS=(
@@ -70,6 +74,7 @@ COMMON_LOGS=(
   aws-routed-eni # eks
   containers     # eks
   pods           # eks
+  cron
   cloud-init.log
   cloud-init-output.log
   user-data.log
@@ -95,6 +100,8 @@ help() {
   echo ""
   echo "   --ignore_metrics Variable To ignore prometheus metrics collection; Pass this flag if DISABLE_METRICS enabled on CNI"
   echo ""
+  echo "   --eks_hybrid Variable To denote that the script is running on an EKS Hybrid node; This will skip IMDS queries for AWS region and instance ID"
+  echo ""
   echo "   --help  Show this help message."
   echo ""
 }
@@ -112,6 +119,9 @@ parse_options() {
         eval "${param}"="${val}"
         ;;
       ignore_metrics)
+        eval "${param}"="${val}"
+        ;;
+      eks_hybrid)
         eval "${param}"="${val}"
         ;;
       help)
@@ -179,8 +189,14 @@ systemd_check() {
   fi
 }
 
-# Get token for IMDSv2 calls
-IMDS_TOKEN=$(curl -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 360")
+load_imds_token() {
+  # Get token for IMDSv2 calls
+  IMDS_TOKEN=$(curl -X PUT -s --max-time 10 --retry 2 "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 360")
+  if [[ $? -ne 0 ]]; then
+    warning "Unable to reach EC2 Metadata Service. Skipping Instance Id, EC2 Region and EC2 AZ"
+    IMDS_TOKEN=""
+  fi
+}
 
 create_directories() {
   # Make sure the directory the script lives in is there. Not an issue if
@@ -194,6 +210,10 @@ create_directories() {
 }
 
 get_instance_id() {
+  if [[ -z "${IMDS_TOKEN}" ]]; then
+    return
+  fi
+
   INSTANCE_ID_FILE="/var/lib/cloud/data/instance-id"
 
   if grep -q '^i-' "$INSTANCE_ID_FILE"; then
@@ -210,6 +230,10 @@ get_instance_id() {
 }
 
 get_region() {
+  if [[ -z "${IMDS_TOKEN}" ]]; then
+    return
+  fi
+
   if REGION=$(curl -H "X-aws-ec2-metadata-token: $IMDS_TOKEN" -f -s --max-time 10 --retry 5 http://169.254.169.254/latest/meta-data/placement/region); then
     echo "${REGION}" > "${COLLECT_DIR}"/system/region.txt
   else
@@ -255,6 +279,10 @@ init() {
   is_root
   systemd_check
   get_pkgtype
+
+  if [[ "${eks_hybrid}" == "false" ]]; then
+    load_imds_token
+  fi
 }
 
 collect() {
@@ -273,15 +301,20 @@ collect() {
   get_containerd_info
   get_docker_info
   get_k8s_info
+  get_nodeadm_info
   get_ipamd_info
   get_multus_info
   get_sysctls_info
   get_networking_info
   get_cni_config
+  get_cni_configuration_variables
+  get_network_policy_ebpf_info
   get_docker_logs
   get_sandboxImage_info
   get_cpu_throttled_processes
   get_io_throttled_processes
+  get_reboot_history
+  get_nvidia_bug_report
 }
 
 pack() {
@@ -304,9 +337,16 @@ get_mounts_info() {
   timeout 75 df --human-readable >> "${COLLECT_DIR}"/storage/mounts.txt
   timeout 75 df --inodes >> "${COLLECT_DIR}"/storage/inodes.txt
   lsblk > "${COLLECT_DIR}"/storage/lsblk.txt
-  lvs > "${COLLECT_DIR}"/storage/lvs.txt
-  pvs > "${COLLECT_DIR}"/storage/pvs.txt
-  vgs > "${COLLECT_DIR}"/storage/vgs.txt
+  if command -v lvs > /dev/null 2>&1; then
+    lvs > "${COLLECT_DIR}"/storage/lvs.txt
+  fi
+  if command -v pvs > /dev/null 2>&1; then
+    pvs > "${COLLECT_DIR}"/storage/pvs.txt
+  fi
+  if command -v vgs > /dev/null 2>&1; then
+    vgs > "${COLLECT_DIR}"/storage/vgs.txt
+  fi
+  cp --force /etc/fstab "${COLLECT_DIR}"/storage/fstab.txt
   mount -t xfs | awk '{print $1}' | xargs -I{} -- sh -c "xfs_info {}; xfs_db -r -c 'freesp -s' {}" > "${COLLECT_DIR}"/storage/xfs.txt
   mount | grep ^overlay | sed 's/.*upperdir=//' | sed 's/,.*//' | xargs -n 1 timeout 75 du -sh | grep -v ^0 > "${COLLECT_DIR}"/storage/pod_local_storage.txt
   ok
@@ -330,10 +370,35 @@ get_iptables_info() {
   else
     try "collect iptables information"
     iptables --wait 1 --numeric --verbose --list --table mangle | tee "${COLLECT_DIR}"/networking/iptables-mangle.txt | sed '/^num\|^$\|^Chain\|^\ pkts.*.destination/d' | echo -e "=======\nTotal Number of Rules: $(wc -l)" >> "${COLLECT_DIR}"/networking/iptables-mangle.txt
+    ip6tables --wait 1 --numeric --verbose --list --table mangle | tee "${COLLECT_DIR}"/networking/ip6tables-mangle.txt | sed '/^num\|^$\|^Chain\|^\ pkts.*.destination/d' | echo -e "=======\nTotal Number of Rules: $(wc -l)" >> "${COLLECT_DIR}"/networking/ip6tables-mangle.txt
     iptables --wait 1 --numeric --verbose --list --table filter | tee "${COLLECT_DIR}"/networking/iptables-filter.txt | sed '/^num\|^$\|^Chain\|^\ pkts.*.destination/d' | echo -e "=======\nTotal Number of Rules: $(wc -l)" >> "${COLLECT_DIR}"/networking/iptables-filter.txt
+    ip6tables --wait 1 --numeric --verbose --list --table filter | tee "${COLLECT_DIR}"/networking/ip6tables-filter.txt | sed '/^num\|^$\|^Chain\|^\ pkts.*.destination/d' | echo -e "=======\nTotal Number of Rules: $(wc -l)" >> "${COLLECT_DIR}"/networking/ip6tables-filter.txt
     iptables --wait 1 --numeric --verbose --list --table nat | tee "${COLLECT_DIR}"/networking/iptables-nat.txt | sed '/^num\|^$\|^Chain\|^\ pkts.*.destination/d' | echo -e "=======\nTotal Number of Rules: $(wc -l)" >> "${COLLECT_DIR}"/networking/iptables-nat.txt
+    ip6tables --wait 1 --numeric --verbose --list --table nat | tee "${COLLECT_DIR}"/networking/ip6tables-nat.txt | sed '/^num\|^$\|^Chain\|^\ pkts.*.destination/d' | echo -e "=======\nTotal Number of Rules: $(wc -l)" >> "${COLLECT_DIR}"/networking/ip6tables-nat.txt
     iptables --wait 1 --numeric --verbose --list | tee "${COLLECT_DIR}"/networking/iptables.txt | sed '/^num\|^$\|^Chain\|^\ pkts.*.destination/d' | echo -e "=======\nTotal Number of Rules: $(wc -l)" >> "${COLLECT_DIR}"/networking/iptables.txt
+    ip6tables --wait 1 --numeric --verbose --list | tee "${COLLECT_DIR}"/networking/ip6tables.txt | sed '/^num\|^$\|^Chain\|^\ pkts.*.destination/d' | echo -e "=======\nTotal Number of Rules: $(wc -l)" >> "${COLLECT_DIR}"/networking/ip6tables.txt
     iptables-save > "${COLLECT_DIR}"/networking/iptables-save.txt
+    ip6tables-save > "${COLLECT_DIR}"/networking/ip6tables-save.txt
+  fi
+
+  if ! command -v ipvsadm > /dev/null 2>&1; then
+    echo "ipvsadm not installed" | tee "${COLLECT_DIR}"/networking/ipvsadm.txt
+  else
+    # check that ip_vs module is loaded in get_modinfo()
+    try "collect ipvs information"
+    ipvsadm --save | tee "${COLLECT_DIR}"/networking/ipvsadm.txt
+    ok -e "\n" | tee -a "${COLLECT_DIR}"/networking/ipvsadm.txt
+    ipvsadm --list --numeric --rate | tee -a "${COLLECT_DIR}"/networking/ipvsadm.txt
+    ok -e "\n" | tee -a "${COLLECT_DIR}"/networking/ipvsadm.txt
+    ipvsadm --list --numeric --stats --exact | tee -a "${COLLECT_DIR}"/networking/ipvsadm.txt
+  fi
+
+  if ! command -v ipset > /dev/null 2>&1; then
+    echo "ipset not installed" | tee "${COLLECT_DIR}"/networking/ipset.txt
+  else
+    ipset --list | tee "${COLLECT_DIR}"/networking/ipset.txt
+    ok -e "\n" | tee -a "${COLLECT_DIR}"/networking/ipset.txt
+    ipset --save | tee -a "${COLLECT_DIR}"/networking/ipset.txt
   fi
 
   ok
@@ -358,6 +423,7 @@ get_common_logs() {
         cp --force --dereference --recursive /var/log/containers/fsx-csi* "${COLLECT_DIR}"/var_log/ 2> /dev/null
         cp --force --dereference --recursive /var/log/containers/fsx-openzfs-csi* "${COLLECT_DIR}"/var_log/ 2> /dev/null
         cp --force --dereference --recursive /var/log/containers/file-cache-csi* "${COLLECT_DIR}"/var_log/ 2> /dev/null
+        cp --force --dereference --recursive /var/log/containers/eks-pod-identity-agent* "${COLLECT_DIR}"/var_log/ 2> /dev/null
         continue
       fi
       if [[ "${entry}" == "pods" ]]; then
@@ -370,6 +436,7 @@ get_common_logs() {
         cp --force --dereference --recursive /var/log/pods/kube-system_fsx-csi-* "${COLLECT_DIR}"/var_log/ 2> /dev/null
         cp --force --dereference --recursive /var/log/pods/kube-system_fsx-openzfs-csi-* "${COLLECT_DIR}"/var_log/ 2> /dev/null
         cp --force --dereference --recursive /var/log/pods/kube-system_file-cache-csi-* "${COLLECT_DIR}"/var_log/ 2> /dev/null
+        cp --force --dereference --recursive /var/log/pods/kube-system_eks-pod-identity-agent* "${COLLECT_DIR}"/var_log/ 2> /dev/null
         continue
       fi
       cp --force --recursive --dereference /var/log/"${entry}" "${COLLECT_DIR}"/var_log/ 2> /dev/null
@@ -395,7 +462,8 @@ get_kernel_info() {
 # collect modinfo on specific modules for debugging purposes
 get_modinfo() {
   try "collect modinfo"
-  modinfo lustre > "${COLLECT_DIR}/modinfo/lustre"
+  modinfo lustre > "${COLLECT_DIR}/modinfo/lustre" 2> /dev/null
+  lsmod | grep -e ip_vs -e nf_conntrack > "${COLLECT_DIR}/modinfo/ip_vs"
 }
 
 get_docker_logs() {
@@ -423,42 +491,68 @@ get_docker_logs() {
 get_k8s_info() {
   try "collect kubelet information"
 
-  if [[ -n "${KUBECONFIG:-}" ]]; then
-    command -v kubectl > /dev/null && kubectl get --kubeconfig="${KUBECONFIG}" svc > "${COLLECT_DIR}"/kubelet/svc.log
-    command -v kubectl > /dev/null && kubectl --kubeconfig="${KUBECONFIG}" config view --output yaml > "${COLLECT_DIR}"/kubelet/kubeconfig.yaml
+  find_kubeconfig() {
+    if [[ -n "${KUBECONFIG:-}" ]]; then
+      echo "${KUBECONFIG}"
+    elif [[ -f /etc/eksctl/kubeconfig.yaml ]]; then
+      echo "/etc/eksctl/kubeconfig.yaml"
+    elif [[ -f /etc/systemd/system/kubelet.service ]]; then
+      echo $(grep kubeconfig /etc/systemd/system/kubelet.service | awk '{print $2}')
+    elif [[ -f /var/lib/kubelet/kubeconfig ]]; then
+      echo "/var/lib/kubelet/kubeconfig"
+    else
+      echo ""
+    fi
+  }
 
-  elif [[ -f /etc/eksctl/kubeconfig.yaml ]]; then
-    KUBECONFIG="/etc/eksctl/kubeconfig.yaml"
-    command -v kubectl > /dev/null && kubectl get --kubeconfig="${KUBECONFIG}" svc > "${COLLECT_DIR}"/kubelet/svc.log
-    command -v kubectl > /dev/null && kubectl --kubeconfig="${KUBECONFIG}" config view --output yaml > "${COLLECT_DIR}"/kubelet/kubeconfig.yaml
+  KUBECONFIG_PATH=$(find_kubeconfig)
 
-  elif [[ -f /etc/systemd/system/kubelet.service ]]; then
-    KUBECONFIG=$(grep kubeconfig /etc/systemd/system/kubelet.service | awk '{print $2}')
-    command -v kubectl > /dev/null && kubectl get --kubeconfig="${KUBECONFIG}" svc > "${COLLECT_DIR}"/kubelet/svc.log
-    command -v kubectl > /dev/null && kubectl --kubeconfig="${KUBECONFIG}" config view --output yaml > "${COLLECT_DIR}"/kubelet/kubeconfig.yaml
-
-  elif [[ -f /var/lib/kubelet/kubeconfig ]]; then
-    KUBECONFIG="/var/lib/kubelet/kubeconfig"
-    command -v kubectl > /dev/null && kubectl get --kubeconfig=${KUBECONFIG} svc > "${COLLECT_DIR}"/kubelet/svc.log
-    command -v kubectl > /dev/null && kubectl --kubeconfig=${KUBECONFIG} config view --output yaml > "${COLLECT_DIR}"/kubelet/kubeconfig.yaml
-
+  if [[ -n "${KUBECONFIG_PATH}" ]]; then
+    command -v kubectl > /dev/null && kubectl get --kubeconfig="${KUBECONFIG_PATH}" svc > "${COLLECT_DIR}"/kubelet/svc.log
+    command -v kubectl > /dev/null && kubectl --kubeconfig="${KUBECONFIG_PATH}" config view --output yaml > "${COLLECT_DIR}"/kubelet/kubeconfig.yaml
   else
     echo "======== Unable to find KUBECONFIG, IGNORING POD DATA =========" >> "${COLLECT_DIR}"/kubelet/svc.log
   fi
 
   # Try to copy the kubeconfig file if kubectl command doesn't exist
-  [[ (! -f "${COLLECT_DIR}/kubelet/kubeconfig.yaml") && (-n ${KUBECONFIG}) ]] && cp ${KUBECONFIG} "${COLLECT_DIR}"/kubelet/kubeconfig.yaml
+  if [[ ! -f "${COLLECT_DIR}/kubelet/kubeconfig.yaml" && -n "${KUBECONFIG_PATH}" ]]; then
+    cp "${KUBECONFIG_PATH}" "${COLLECT_DIR}/kubelet/kubeconfig.yaml"
+  fi
 
   case "${INIT_TYPE}" in
-    systemd)
-      timeout 75 journalctl --unit=kubelet --since "${DAYS_10}" > "${COLLECT_DIR}"/kubelet/kubelet.log
+    systemd | snap)
+      timeout 75 snap list kubelet-eks > /dev/null 2>&1
+      if [ 0 -eq $? ]; then # Check if previous command was successful.
+        timeout 75 snap logs kubelet-eks -n all > "${COLLECT_DIR}"/kubelet/kubelet.log
 
-      systemctl cat kubelet > "${COLLECT_DIR}"/kubelet/kubelet_service.txt 2>&1
+        timeout 75 snap get kubelet-eks > "${COLLECT_DIR}"/kubelet/kubelet-eks_service.txt 2>&1
+      else
+        timeout 75 journalctl --unit=kubelet --since "${DAYS_10}" > "${COLLECT_DIR}"/kubelet/kubelet.log
+
+        systemctl cat kubelet > "${COLLECT_DIR}"/kubelet/kubelet_service.txt 2>&1
+
+        cp --force --recursive --dereference /etc/kubernetes/kubelet/config.json "${COLLECT_DIR}"/kubelet/config.json 2> /dev/null
+        cp --force --recursive --dereference /etc/kubernetes/kubelet/config.json.d "${COLLECT_DIR}"/kubelet/config.json.d 2> /dev/null
+
+        cp --force --recursive --dereference /etc/kubernetes/kubelet/kubelet-config.json "${COLLECT_DIR}"/kubelet/kubelet-config.json 2> /dev/null
+      fi
       ;;
-    snap)
-      timeout 75 snap logs kubelet-eks -n all > "${COLLECT_DIR}"/kubelet/kubelet.log
+    *)
+      warning "The current operating system is not supported."
+      ;;
+  esac
 
-      timeout 75 snap get kubelet-eks > "${COLLECT_DIR}"/kubelet/kubelet-eks_service.txt 2>&1
+  ok
+}
+
+get_nodeadm_info() {
+  try "collect nodeadm information"
+  case "${INIT_TYPE}" in
+    systemd)
+      timeout 75 journalctl --unit=nodeadm-config --since "${DAYS_10}" > "${COLLECT_DIR}"/nodeadm/nodeadm-config.log
+
+      timeout 75 journalctl --unit=nodeadm-run --since "${DAYS_10}" > "${COLLECT_DIR}"/nodeadm/nodeadm-run.log
+
       ;;
     *)
       warning "The current operating system is not supported."
@@ -486,7 +580,9 @@ get_ipamd_info() {
   fi
 
   try "collect L-IPAMD checkpoint"
-  cp /var/run/aws-node/ipam.json "${COLLECT_DIR}"/ipamd/ipam.json
+  if [[ -f /var/run/aws-node/ipam.json ]]; then
+    cp /var/run/aws-node/ipam.json "${COLLECT_DIR}"/ipamd/ipam.json
+  fi
 
   ok
 }
@@ -506,21 +602,46 @@ get_sysctls_info() {
   ok
 }
 
+get_network_policy_ebpf_info() {
+  try "collect network policy ebpf loaded data"
+  if [[ -x /opt/cni/bin/aws-eks-na-cli ]]; then
+    echo "*** EBPF loaded data ***" >> "${COLLECT_DIR}"/networking/ebpf-data.txt
+    LOADED_EBPF=$(/opt/cni/bin/aws-eks-na-cli ebpf loaded-ebpfdata | tee -a "${COLLECT_DIR}"/networking/ebpf-data.txt)
+
+    for mapid in $(echo "$LOADED_EBPF" | grep "Map ID:" | sed 's/Map ID: \+//' | sort | uniq); do
+      echo "*** EBPF Maps Data for Map ID $mapid ***" >> "${COLLECT_DIR}"/networking/ebpf-maps-data.txt
+      /opt/cni/bin/aws-eks-na-cli ebpf dump-maps $mapid >> "${COLLECT_DIR}"/networking/ebpf-maps-data.txt
+    done
+  fi
+
+  ok
+}
+
 get_networking_info() {
   try "collect networking infomation"
 
   # conntrack info
-  echo "*** Output of conntrack -S *** " >> "${COLLECT_DIR}"/networking/conntrack.txt
-  timeout 75 conntrack -S >> "${COLLECT_DIR}"/networking/conntrack.txt
-  echo "*** Output of conntrack -L ***" >> "${COLLECT_DIR}"/networking/conntrack.txt
-  timeout 75 conntrack -L >> "${COLLECT_DIR}"/networking/conntrack.txt
+  if command -v conntrack > /dev/null 2>&1; then
+    echo "*** Output of conntrack -S *** " >> "${COLLECT_DIR}"/networking/conntrack.txt
+    timeout 75 conntrack -S >> "${COLLECT_DIR}"/networking/conntrack.txt
+    echo "*** Output of conntrack -L ***" >> "${COLLECT_DIR}"/networking/conntrack.txt
+    timeout 75 conntrack -L >> "${COLLECT_DIR}"/networking/conntrack.txt
+    echo "*** Output of conntrack -L -f ipv6 ***" >> "${COLLECT_DIR}"/networking/conntrack6.txt
+    timeout 75 conntrack -L -f ipv6 >> "${COLLECT_DIR}"/networking/conntrack6.txt
+  fi
 
   # ifconfig
-  timeout 75 ifconfig > "${COLLECT_DIR}"/networking/ifconfig.txt
+  if command -v ifconfig > /dev/null 2>&1; then
+    timeout 75 ifconfig > "${COLLECT_DIR}"/networking/ifconfig.txt
+  fi
 
   # ip rule show
   timeout 75 ip rule show > "${COLLECT_DIR}"/networking/iprule.txt
+  timeout 75 ip -6 rule show > "${COLLECT_DIR}"/networking/ip6rule.txt
+
+  # ip route show
   timeout 75 ip route show table all >> "${COLLECT_DIR}"/networking/iproute.txt
+  timeout 75 ip -6 route show table all >> "${COLLECT_DIR}"/networking/ip6route.txt
 
   # configure-multicard-interfaces
   timeout 75 journalctl -u configure-multicard-interfaces > "${COLLECT_DIR}"/networking/configure-multicard-interfaces.txt || echo -e "\tTimed out, ignoring \"configure-multicard-interfaces unit output \" "
@@ -534,7 +655,7 @@ get_networking_info() {
     CA_CRT=$(grep certificate-authority: "${COLLECT_DIR}"/kubelet/kubeconfig.yaml | sed 's/.*certificate-authority: //')
     for i in $(seq 5); do
       echo -e "curling ${API_SERVER} ($i of 5) $(date --utc +%FT%T.%3N%Z)\n\n" >> ${COLLECT_DIR}"/networking/curl_api_server.txt"
-      timeout 75 curl -v --cacert "${CA_CRT}" "${API_SERVER}"/livez?verbose >> ${COLLECT_DIR}"/networking/curl_api_server.txt" 2>&1
+      timeout 75 curl -v --connect-timeout 3 --max-time 10 --noproxy '*' --cacert "${CA_CRT}" "${API_SERVER}"/livez?verbose >> ${COLLECT_DIR}"/networking/curl_api_server.txt" 2>&1
     done
   fi
 
@@ -555,6 +676,35 @@ get_cni_config() {
 
   if [[ -e "/etc/cni/net.d/" ]]; then
     cp --force --recursive --dereference /etc/cni/net.d/* "${COLLECT_DIR}"/cni/
+  fi
+
+  ok
+}
+
+get_cni_configuration_variables() {
+  # To get cni configuration variables, gather from the main container "amazon-k8s-cni"
+  # - https://github.com/aws/amazon-vpc-cni-k8s#cni-configuration-variables
+  try "collect CNI Configuration Variables from Docker"
+
+  # "docker container list" will only show "RUNNING" containers.
+  # "docker container inspect" will generate plain text output.
+  if [[ "$(pgrep -o dockerd)" -ne 0 ]]; then
+    timeout 75 docker container list | awk '/amazon-k8s-cni/{print$NF}' | xargs -n 1 docker container inspect > "${COLLECT_DIR}"/cni/cni-configuration-variables-dockerd.txt 2>&1 || echo -e "\tTimed out, ignoring \"cni configuration variables output \" "
+  else
+    warning "The Docker daemon is not running."
+  fi
+
+  try "collect CNI Configuration Variables from Containerd"
+
+  # "ctr container list" will list down all containers, including stopped ones.
+  # "ctr container info" will generate JSON format output.
+  if ! command -v ctr > /dev/null 2>&1; then
+    warning "ctr not installed"
+  else
+    # "ctr --namespace k8s.io container list" will return two containers
+    # - amazon-k8s-cni:v1.xx.yy
+    # - amazon-k8s-cni-init:v1.xx.yy
+    timeout 75 ctr --namespace k8s.io container list | awk '/amazon-k8s-cni:v/{print$1}' | xargs -n 1 ctr --namespace k8s.io container info > "${COLLECT_DIR}"/cni/cni-configuration-variables-containerd.json 2>&1 || echo -e "\tTimed out, ignoring \"cni configuration variables output \" "
   fi
 
   ok
@@ -605,12 +755,26 @@ get_system_services() {
       ;;
   esac
 
+  if [ "${INIT_TYPE}" = "systemd" ]; then
+    systemd-analyze plot > "${COLLECT_DIR}/system/systemd-analyze.svg" 2>&1
+  fi
+
   timeout 75 top -b -n 1 > "${COLLECT_DIR}"/system/top.txt 2>&1
   timeout 75 ps fauxwww --headers > "${COLLECT_DIR}"/system/ps.txt 2>&1
   timeout 75 ps -eTF --headers > "${COLLECT_DIR}"/system/ps-threads.txt 2>&1
   timeout 75 netstat -plant > "${COLLECT_DIR}"/system/netstat.txt 2>&1
   timeout 75 cat /proc/stat > "${COLLECT_DIR}"/system/procstat.txt 2>&1
   timeout 75 cat /proc/[0-9]*/stat > "${COLLECT_DIR}"/system/allprocstat.txt 2>&1
+
+  # collect pids which have large environments
+  echo -e "PID\tCount" > "${COLLECT_DIR}/system/large_environments.txt"
+  for i in /proc/*/environ; do
+    ENV_COUNT=$(tr '\0' '\n' < "$i" | grep -cv '^$')
+    if ((ENV_COUNT > 1000)); then
+      PID=$(echo "$i" | sed 's#/proc/##' | sed 's#/environ##')
+      echo -e "${PID}\t${ENV_COUNT}" >> "${COLLECT_DIR}/system/large_environments.txt"
+    fi
+  done
 
   ok
 }
@@ -700,8 +864,34 @@ get_io_throttled_processes() {
   command echo -e "PID Name Block IO Delay (centisconds)" > ${IO_THROTTLE_LOG}
   # column 42 is Aggregated block I/O delays, measured in centiseconds so we capture the non-zero block
   # I/O delays.
-  command cut -d" " -f 1,2,42 /proc/[0-9]*/stat | sort -n -k+3 -r | grep -v 0$ >> ${IO_THROTTLE_LOG}
+  command cut -d" " -f 1,2,42 /proc/[0-9]*/stat | sort -n -k+3 -r | grep -v " 0$" >> ${IO_THROTTLE_LOG}
   ok
+}
+
+get_reboot_history() {
+  try "Collect reboot history"
+  timeout 75 last reboot > "${COLLECT_DIR}"/system/last_reboot.txt 2>&1 || echo -e "\tTimed out, ignoring \"reboot history output \" "
+  ok
+}
+
+get_nvidia_bug_report() {
+  try "Collect Nvidia Bug report"
+  if ! command -v nvidia-bug-report.sh &> /dev/null; then
+    echo "No Nvidia drivers found, nothing to do."
+  else
+    timeout 75 nvidia-bug-report.sh --output-file "${COLLECT_DIR}"/gpu/nvidia-bug-report.log &> /dev/null
+  fi
+  ok
+}
+
+banner() {
+  echo >&2 "\
+****************************************************************************************
+* WARNING: The log bundle collected by this script may contain sensitive information.  *
+*                                                                                      *
+* Please review the contents of the log bundle carefully and redact or obfuscate       *
+* any information you do not wish to be accessible before sharing it with others.      *
+****************************************************************************************"
 }
 
 # -----------------------------------------------------------------------------
@@ -711,3 +901,4 @@ parse_options "$@"
 collect
 pack
 finished
+banner

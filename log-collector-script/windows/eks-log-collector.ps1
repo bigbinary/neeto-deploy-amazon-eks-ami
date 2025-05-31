@@ -1,27 +1,27 @@
-<# 
+<#
     Copyright 2017 Amazon.com, Inc. or its affiliates. All Rights Reserved.
     Licensed under the Apache License, Version 2.0 (the "License"). You may not use this file except in compliance with the License. A copy of the License is located at
 
         http://aws.amazon.com/apache2.0/
 
-    or in the "license" file accompanying this file. 
+    or in the "license" file accompanying this file.
     This file is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the License for the specific language governing permissions and limitations under the License.
 
-.SYNOPSIS 
+.SYNOPSIS
     Collects EKS Logs
-.DESCRIPTION 
-    Run the script to gather basic operating system, Docker daemon, and kubelet logs. 
+.DESCRIPTION
+    Run the script to gather basic operating system, Docker daemon, and kubelet logs.
 
 .NOTES
     You need to run this script with Elevated permissions to allow for the collection of the installed applications list
-.EXAMPLE 
+.EXAMPLE
     eks-log-collector.ps1
-    Gather basic operating system, Docker daemon, and kubelet logs. 
+    Gather basic operating system, Docker daemon, and kubelet logs.
 
 #>
 
 param(
-    [Parameter(Mandatory=$False)][string]$RunMode = "Collect"   
+    [Parameter(Mandatory=$False)][string]$RunMode = "Collect"
     )
 
 # Common options
@@ -62,6 +62,7 @@ Function create_working_dir{
         New-Item -type directory -path $info_system\containerd_log -Force >$null
         New-Item -type directory -path $info_system\network -Force >$null
         New-Item -type directory -path $info_system\network\hns -Force >$null
+        New-Item -type directory -path $info_system\events -Force >$null
         Write-Host "OK" -ForegroundColor "green"
     }
     catch {
@@ -111,10 +112,10 @@ Function get_sysinfo{
         Write-Host "OK" -ForegroundColor "green"
     }
     catch {
-        Write-Error "Unable to collect system information" 
+        Write-Error "Unable to collect system information"
         Break
-    }  
-        
+    }
+
 }
 
 Function is_diskfull{
@@ -127,11 +128,11 @@ Function is_diskfull{
         Write-Host "OK" -ForegroundColor "green"
     }
     catch {
-        Write-Error "Unable to Determine Free Disk Space" 
+        Write-Error "Unable to Determine Free Disk Space"
         Break
     }
     if ($percent -lt $threshold){
-        Write-Error "C: drive only has $percent% free space, please ensure there is at least $threshold% free disk space to collect and store the log files" 
+        Write-Error "C: drive only has $percent% free space, please ensure there is at least $threshold% free disk space to collect and store the log files"
         Break
     }
 }
@@ -267,7 +268,7 @@ Function get_eks_logs{
 Function get_k8s_info{
     try {
         Write-Host "Collecting Kubelet logs"
-        Get-EventLog -LogName EKS -Source kubelet | Sort-Object Time | Export-CSV $info_system/kubelet/kubelet-service.csv
+        Get-WinEvent -ProviderName kubelet | Export-CSV $info_system/kubelet/kubelet-service.csv
         Write-Host "OK" -foregroundcolor "green"
     }
     catch{
@@ -277,7 +278,7 @@ Function get_k8s_info{
 
     try {
         Write-Host "Collecting Kube-proxy logs"
-        Get-EventLog -LogName EKS -Source kube-proxy | Sort-Object Time | Export-CSV $info_system/kube-proxy/kube-proxy-service.csv
+        Get-WinEvent -ProviderName kube-proxy | Export-CSV $info_system/kube-proxy/kube-proxy-service.csv
         Write-Host "OK" -foregroundcolor "green"
     }
     catch{
@@ -302,7 +303,7 @@ Function get_docker_logs{
     Write-Host "Collecting Docker daemon logs"
     if (check_service_installed_and_running "docker") {
         try {
-            Get-EventLog -LogName Application -Source Docker | Sort-Object Time | Export-CSV $info_system/docker_log/docker-daemon.csv
+            Get-WinEvent -ProviderName Docker | Export-CSV $info_system/docker_log/docker-daemon.csv
             Write-Host "OK" -foregroundcolor "green"
         }
         catch {
@@ -328,7 +329,7 @@ Function get_containerd_logs{
 
 Function get_network_info{
     try {
-        Write-Host "Collecting network Information" 
+        Write-Host "Collecting network Information"
         Get-HnsNetwork | Select Name, Type, Id, AddressPrefix > $info_system\network\hns\network.txt
         Get-hnsnetwork | Convertto-json -Depth 20 >> $info_system\network\hns\network.txt
         Get-hnsnetwork | % { Get-HnsNetwork -Id $_.ID -Detailed } | Convertto-json -Depth 20 >> $info_system\network\hns\networkdetailed.txt
@@ -347,6 +348,25 @@ Function get_network_info{
         Write-Error "Unable to collect network information"
         Break
     }
+}
+
+Function get_windows_events{
+    try {
+        Write-Host "Collecting Windows events"
+        Copy-Item "$env:SystemDrive\Windows\System32\Winevt\Logs\Application.evtx" -Destination $info_system\events
+        Copy-Item "$env:SystemDrive\Windows\System32\Winevt\Logs\EKS.evtx" -Destination $info_system\events
+        Copy-Item "$env:SystemDrive\Windows\System32\Winevt\Logs\System.evtx" -Destination $info_system\events
+        Copy-Item "$env:SystemDrive\Windows\System32\Winevt\Logs\\Microsoft-Windows-Containers*.evtx" -Destination $info_system\events
+        Copy-Item "$env:SystemDrive\Windows\System32\Winevt\Logs\\Microsoft-Windows-Host-Network-Service*.evtx" -Destination $info_system\events
+        Copy-Item "$env:SystemDrive\Windows\System32\Winevt\Logs\\Microsoft-Windows-Hyper-V-Compute*.evtx" -Destination $info_system\events
+
+        Write-Host "OK" -ForegroundColor "green"
+    }
+    catch {
+        Write-Error "Unable to collect Windows events"
+        Break
+    }
+
 }
 
 Function cleanup{
@@ -373,7 +393,7 @@ Function init{
     create_working_dir
     get_sysinfo
 }
-    
+
 Function collect{
     init
     is_diskfull
@@ -390,16 +410,16 @@ Function collect{
     get_containerd_logs
     get_eks_logs
     get_network_info
-
+    get_windows_events
 }
 
 #--------------------------
 #Main-function
-Function main {   
+Function main {
     Write-Host "Running Default(Collect) Mode" -foregroundcolor "blue"
     cleanup
     collect
-    pack 
+    pack
 }
 
 #Entry point

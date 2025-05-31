@@ -9,7 +9,7 @@ This project was created to collect Amazon EKS log files and OS logs for trouble
 * Run this project as the Administrator user:
 
 ```
-Invoke-WebRequest -OutFile eks-log-collector.ps1 https://raw.githubusercontent.com/awslabs/amazon-eks-ami/master/log-collector-script/windows/eks-log-collector.ps1
+Invoke-WebRequest -OutFile eks-log-collector.ps1 https://raw.githubusercontent.com/awslabs/amazon-eks-ami/main/log-collector-script/windows/eks-log-collector.ps1
 .\eks-log-collector.ps1
 ```
 
@@ -84,7 +84,7 @@ Done... your bundled logs are located in  C:\log-collector\eks_i-0b318f704c74b6a
 
 * SSM agent should be installed and running on Worker Node(s). [How to Install SSM Agent link](https://docs.aws.amazon.com/systems-manager/latest/userguide/sysman-manual-agent-install.html)
 
-* Worker Node(s) should have required permissions to communicate with SSM service. IAM managed role `AmazonSSMManagedInstanceCore` will have all the required permission for SSM agent to run on EC2 instances. The IAM managed role `AmazonSSMManagedInstanceCore` has `S3:PutObject` permission to all S3 resources.
+* Worker Node(s) should have required permissions to communicate with SSM service and upload data to your S3 Bucket. The IAM managed policy `AmazonSSMManagedInstanceCore` will have all the required permissions for SSM agent to run on EC2 instances. You will need `S3:PutObject` permission to your S3 resources accordingly.
 
 *Note:* For more granular control of the IAM permission check [Actions defined by AWS Systems Manager](https://docs.aws.amazon.com/IAM/latest/UserGuide/list_awssystemsmanager.html%23awssystemsmanager-actions-as-permissions)
 
@@ -98,7 +98,7 @@ Done... your bundled logs are located in  C:\log-collector\eks_i-0b318f704c74b6a
 aws ssm create-document \
   --name "EKSLogCollectorWindows" \
   --document-type "Command" \
-  --content https://raw.githubusercontent.com/awslabs/amazon-eks-ami/master/log-collector-script/windows/eks-ssm-content.json
+  --content https://raw.githubusercontent.com/awslabs/amazon-eks-ami/main/log-collector-script/windows/eks-ssm-content.json
 ```
 
 2. To execute the bash script in the SSM document and to collect the logs from worker, run the following command:
@@ -121,3 +121,12 @@ aws ssm get-command-invocation \
 ```
 
 4. Once the above command is executed successfully, the logs should be present in the S3 bucket specified in the previous step.
+
+### Collect User Data
+
+If collecting use rdata is required as apart of troubleshooting please use the commands below to retrieve data via IMDSv2:
+
+```
+[string]$token = Invoke-RestMethod -Headers @{"X-aws-ec2-metadata-token-ttl-seconds" = "21600"} -Method PUT -Uri http://169.254.169.254/latest/api/token
+Invoke-RestMethod -Headers @{"X-aws-ec2-metadata-token" = $token} -Method GET -Uri http://169.254.169.254/latest/user-data
+```

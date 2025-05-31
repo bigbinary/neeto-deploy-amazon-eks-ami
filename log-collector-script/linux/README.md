@@ -11,11 +11,20 @@ At a high level, you run this script on your Kubernetes node, and it will collec
 * Run this project as the root user
 
 ```
-curl -O https://raw.githubusercontent.com/awslabs/amazon-eks-ami/master/log-collector-script/linux/eks-log-collector.sh
+curl -O https://amazon-eks.s3.amazonaws.com/support/log-collector-script/linux/eks-log-collector.sh
 sudo bash eks-log-collector.sh
 ```
 
 Confirm if the tarball file was successfully created (it can be .tgz or .tar.gz)
+
+> [!NOTE]
+> If you plan to provide this log bundle to another party, please review the
+> contents of the bundle and redact anything you wish not to be accessible.
+>
+> The following are sources you might potentially want to obfuscate:
+> * `/system/ps.txt` contains process command line arguments from `ps`.
+> * `/var/log/cloud-init-output.log` contains output from scripts that are run from ec2 userdata.
+> * `/cni/cni-configuration-variables-containerd.json` contains container info (read via `ctr`) which includes environment variables.
 
 #### Retrieving the logs
 
@@ -36,6 +45,8 @@ OPTIONS:
 
    --ignore_metrics Variable To ignore prometheus metrics collection; Pass this flag if DISABLE_METRICS enabled on CNI
 
+   --eks_hybrid Variable To denote that the script is running on an EKS Hybrid node; This will skip IMDS queries for AWS region and instance ID
+
    --help  Show this help message.
 ```
 
@@ -46,7 +57,7 @@ The following output shows this project running in normal mode.
 ```
 $ sudo bash eks-log-collector.sh
 
-        This is version 0.7.3. New versions can be found at https://github.com/awslabs/amazon-eks-ami/blob/master/log-collector-script/
+        This is version 0.7.3. New versions can be found at https://github.com/awslabs/amazon-eks-ami/blob/main/log-collector-script/
 
 Trying to collect common operating system logs...
 Trying to collect kernel logs...
@@ -91,7 +102,7 @@ Trying to archive gathered information...
 
 * SSM agent should be installed and running on Worker Node(s). [How to Install SSM Agent link](https://docs.aws.amazon.com/systems-manager/latest/userguide/sysman-manual-agent-install.html)
 
-* Worker Node(s) should have required permissions to communicate with SSM service. IAM managed role `AmazonSSMManagedInstanceCore` will have all the required permission for SSM agent to run on EC2 instances. The IAM managed role `AmazonSSMManagedInstanceCore` has `S3:PutObject` permission to all S3 resources.
+* Worker Node(s) should have required permissions to communicate with SSM service and upload data to your S3 Bucket. The IAM managed policy `AmazonSSMManagedInstanceCore` will have all the required permissions for SSM agent to run on EC2 instances. You will need `S3:PutObject` permission to your S3 resources accordingly.
 
 *Note:* For more granular control of the IAM permission check [Actions defined by AWS Systems Manager](https://docs.aws.amazon.com/IAM/latest/UserGuide/list_awssystemsmanager.html%23awssystemsmanager-actions-as-permissions)
 
@@ -102,7 +113,7 @@ Trying to archive gathered information...
 1. Create the SSM document named "EKSLogCollector" using the following commands:
 
 ```
-curl -O https://raw.githubusercontent.com/awslabs/amazon-eks-ami/master/log-collector-script/linux/eks-ssm-content.json
+curl -O https://amazon-eks.s3.amazonaws.com/support/log-collector-script/linux/eks-ssm-content.json
 aws ssm create-document \
   --name "EKSLogCollectorLinux" \
   --document-type "Command" \
@@ -129,3 +140,12 @@ aws ssm get-command-invocation \
 ```
 
 4. Once the above command is executed successfully, the logs should be present in the S3 bucket specified in the previous step.
+
+### Collect User Data
+
+If collecting user data is required as apart of troubleshooting please use the commands below to retrieve data via IMDSv2:
+
+```
+TOKEN=`curl -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 21600"` \
+&& curl -H "X-aws-ec2-metadata-token: $TOKEN" -v http://169.254.169.254/latest/user-data
+```

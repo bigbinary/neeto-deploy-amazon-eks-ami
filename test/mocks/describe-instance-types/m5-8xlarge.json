@@ -1,6 +1,0 @@
-{
-    "Hypervisor": "nitro",
-    "EniCount": 8,
-    "PodsPerEniCount": 30,
-    "CpuCount": 32
-}
